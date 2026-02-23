@@ -1,4 +1,4 @@
-package main.java.com.example.risk.model;
+package com.example.risk.model;
 
 public class RuleEnvelope{
     private String op; // "UPSERT" or "DELETE"

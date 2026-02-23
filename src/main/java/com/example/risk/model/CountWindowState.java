@@ -1,3 +1,5 @@
+package com.example.risk.model;
+
 public class CountWindowState {
     
     // window start time (event time), in milliseconds

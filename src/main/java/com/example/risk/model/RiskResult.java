@@ -1,9 +1,8 @@
+package com.example.risk.model;
+
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-
-import main.java.com.example.risk.model.BehaviorEvent;
-import main.java.com.example.risk.model.RiskRule;
 
 public class RiskResult {
 
