@@ -68,7 +68,7 @@ public class RiskJob {
             .setBootstrapServers(bootstrapServers)
             .setTopics(behaviorTopic)
             .setGroupId("risk-job-behavior")
-            .setStartingOffsets(OffsetsInitializer.latest())
+            .setStartingOffsets(OffsetsInitializer.earliest())
             .setValueOnlyDeserializer(new SimpleStringSchema())
             .build();
 
@@ -85,7 +85,7 @@ public class RiskJob {
             .setBootstrapServers(bootstrapServers)
             .setTopics(rulesTopic)
             .setGroupId("risk-job-rules")
-            .setStartingOffsets(OffsetsInitializer.latest())
+            .setStartingOffsets(OffsetsInitializer.earliest())
             .setValueOnlyDeserializer(new SimpleStringSchema())
             .build();
 
@@ -94,6 +94,8 @@ public class RiskJob {
             WatermarkStrategy.noWatermarks(),
             "rules-source"
         );
+
+        rulesRaw.print("RULE_RAW");
         
         // ===== JSON parse =====
         ObjectMapper mapper = new ObjectMapper();
@@ -127,6 +129,8 @@ public class RiskJob {
             .map(r -> mapper.writeValueAsString(r))
             .returns(String.class);
 
+        results.print("Risk");
+
         env.execute("Rule Driven Risk Detection Job");
     }
     
@@ -156,6 +160,20 @@ public class RiskJob {
             BroadcastState<String, RiskRule> rulesState = ctx.getBroadcastState(RULES_BROADCAST_DESC);
 
             // todo
+            String op = value.getOp();
+            RiskRule rule = value.getRule();
+
+            if(op == null || rule == null || rule.getRule_id() == null) {
+                return;
+            }
+
+            if("DELETE".equalsIgnoreCase(op)) {
+                rulesState.remove(rule.getRule_id());
+            }
+            else{
+                rulesState.put(rule.getRule_id(), rule); // UPSERT
+            }
+
         }
 
 
@@ -168,6 +186,67 @@ public class RiskJob {
             ReadOnlyBroadcastState<String, RiskRule> rulesState = ctx.getBroadcastState(RULES_BROADCAST_DESC);
         
             // todo
+            for(var entry : rulesState.immutableEntries()){
+                RiskRule rule = entry.getValue();
+                if(rule == null) continue;
+
+                // enabled
+                if(!rule.isEnabled()) continue;
+
+                // match event_type
+                if(evt.getEvent_type() == null || rule.getEvent_type() == null) continue;
+                if(!evt.getEvent_type().equals(rule.getEvent_type())) continue;
+
+                // only implement count_in_window in v1
+                if(rule.getRule_type() == null || !"count_in_window".equals(rule.getRule_type())) continue;
+
+                // evaluate count window
+                boolean hit = evaluateCountInWindow(evt, rule);
+
+                // output only when hit
+                if(hit){
+                    RiskResult rr = RiskResult.build(rule, evt);
+                    rr.getDetail().put("threshold", String.valueOf(rule.getThreshold()));
+                    rr.getDetail().put("window_minutes", String.valueOf(rule.getWindow_minutes()));
+                    out.collect(rr);
+                }
+            }
+        }
+
+        private boolean evaluateCountInWindow(BehaviorEvent evt, RiskRule rule) throws Exception {
+            String ruleId = rule.getRule_id();
+
+            long windowMs = rule.getWindow_minutes() * 60_000L;
+            long eventTs = evt.getEventTimeMillis();
+
+            CountWindowState st = perUserRuleState.get(ruleId); // get current user's state according to the specifc rule
+
+            // first time for this (user, rule)
+            if(st == null){
+                st = new CountWindowState();
+                st.setWindow_start_ms(eventTs);
+                st.setCount(1);
+                st.setLast_event_ms(eventTs);
+                perUserRuleState.put(ruleId, st);
+                return false;
+            }
+
+            // window expired -> reset
+            if(eventTs - st.getWindow_start_ms() >= windowMs){
+                st.setWindow_start_ms(eventTs);
+                st.setCount(1);
+                st.setLast_event_ms(eventTs);
+                perUserRuleState.put(ruleId, st);
+                return false;
+            }
+
+            // within window -> increment
+            st.setCount(st.getCount() + 1);
+            st.setLast_event_ms(eventTs);
+            perUserRuleState.put(ruleId, st);
+
+            return st.getCount() == rule.getThreshold() + 1; // only alert once
         }
     }
+
 }
